@@ -356,7 +356,7 @@ AP.add_argument('--window', type=int, default=env_int('FTB_WINDOW', 60),
                 help='окно наблюдения, сек (FTB_WINDOW)')
 AP.add_argument('--min-hosts', type=int, default=env_int('FTB_MIN_HOSTS', 25),
                 help='порог: разных адресов назначения за окно (FTB_MIN_HOSTS)')
-AP.add_argument('--min-ports', type=int, default=env_int('FTB_MIN_PORTS', 20),
+AP.add_argument('--min-ports', type=int, default=env_int('FTB_MIN_PORTS', 25),
                 help='порог: разных портов назначения за окно (FTB_MIN_PORTS)')
 AP.add_argument('--cooldown', type=int, default=env_int('FTB_COOLDOWN', 300),
                 help='не слать повторный отчёт на тот же IP чаще, сек (FTB_COOLDOWN)')
@@ -395,7 +395,8 @@ COMMON = {
 COMMON |= set(range(3478, 3498))    # STUN/TURN — установка p2p-звонков (WebRTC, мессенджеры)
 COMMON |= {5349}                    # STUN/TURN over TLS
 COMMON |= set(range(16384, 16404))  # RTP — медиапотоки звонков
-COMMON |= set(range(19302, 19310))  # STUN Google (Meet, Hangouts, WebRTC)
+COMMON |= set(range(19302, 19320))  # STUN/медиа Google (Meet, WebRTC; наблюдали 19314/19316)
+COMMON |= set(range(27000, 27201))  # Steam Datagram Relay и игровые серверы Valve (Dota и др.)
 
 # Оператор может расширить список портов, которые не считать веером (FTB_IGNORE_PORTS или
 # --ignore-ports): в замерах трафика встречались легальные P2P/сервисы на своих портах (WUDO
