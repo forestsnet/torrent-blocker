@@ -347,7 +347,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.0.0'
+VERSION = '2.1.0'
 MARK = 'fsnt-torrent-blocker'
 
 
@@ -860,14 +860,15 @@ class Reporter:
         self.sent = collections.deque()
         self.paused_until = 0
 
-    def report(self, user, cip, cport, net, dst, dport, inbound, summary, tag):
+    def report(self, user, cip, cport, net, dst, dport, inbound, summary, tag, detail=''):
         now = time.time()
         with self.lock:
             if now - self.last_ip.get(cip, 0) < A.cooldown:
                 return None
             self.last_ip[cip] = now
             if A.dry_run:
-                log(f'[dry-run:{tag}] user={user} ip={cip} {summary}')
+                log(f'[dry-run:{tag}] user={user} ip={cip} {summary}'
+                    + (f' | {detail}' if detail else ''))
                 return 'dry-run'
             while self.sent and self.sent[0] < now - 60:
                 self.sent.popleft()
@@ -882,7 +883,8 @@ class Reporter:
             self.sent.append(now)
             rep = make_report(user, cip, cport, net, dst, dport, inbound, summary)
             st = send(self.node, rep)
-            log(f'[{tag}] user={user} ip={cip} {summary} -> {st}')
+            log(f'[{tag}] user={user} ip={cip} {summary} -> {st}'
+                + (f' | {detail}' if detail else ''))
             return st
 
 
@@ -996,6 +998,7 @@ def main():
         threading.Thread(target=watch_btguard, args=(reporter,), daemon=True).start()
 
     ev = collections.defaultdict(collections.deque)
+    ev_gi = collections.defaultdict(collections.deque)   # игровые (игнор) соединения — для доказательства
     sweep = prune = time.time()
     for ln in follow(node, A.log):
         m = LINE.search(ln)
@@ -1015,6 +1018,13 @@ def main():
                         del peer_index[k]
                     prune = now
 
+        # учёт соединений в игровые сети — доказательство в отчёте (сколько срезано)
+        if ign and net == 'udp':
+            gq = ev_gi[m['user']]
+            gq.append(now)
+            while gq and gq[0] < now - A.window:
+                gq.popleft()
+
         # веерный детект
         if ign or dport in COMMON or not is_global(dst):
             continue
@@ -1026,6 +1036,8 @@ def main():
         if now - sweep > A.window:
             for u in [u for u, d in ev.items() if not d or d[-1][0] < now - A.window]:
                 del ev[u]
+            for u in [u for u, d in ev_gi.items() if not d or d[-1][0] < now - A.window]:
+                del ev_gi[u]
             sweep = now
         hosts = {x[3] for x in q}
         ports = {x[4] for x in q}
@@ -1034,10 +1046,17 @@ def main():
         cip = collections.Counter(x[1] for x in q).most_common(1)[0][0]
         nets = collections.Counter(x[5] for x in q)
         ex = next(x for x in reversed(q) if x[1] == cip)
+        gq = ev_gi.get(m['user'])
+        if gq:
+            while gq and gq[0] < now - A.window:
+                gq.popleft()
+        gi = len(gq) if gq else 0
+        sample = list(dict.fromkeys(f'{x[3]}:{x[4]}' for x in q))[:4]
         summary = (f'fanout {len(hosts)} hosts / {len(ports)} ports / {len(q)} conns in '
                    f'{A.window}s (tcp {nets["tcp"]}, udp {nets["udp"]})')
+        detail = f'игр.игнор={gi} пиры: {", ".join(sample)}'
         if reporter.report(m['user'], cip, ex[2], nets.most_common(1)[0][0],
-                           ex[3], ex[4], ex[6], summary, 'веер') is not None:
+                           ex[3], ex[4], ex[6], summary, 'веер', detail) is not None:
             q.clear()
 
 
