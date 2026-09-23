@@ -9,6 +9,7 @@
 # уведомление в Telegram, вебхук torrent_blocker.report.
 
 import argparse
+import bisect
 import collections
 import ipaddress
 import json
@@ -46,6 +47,8 @@ AP.add_argument('--log', default=os.environ.get('FTB_LOG', ''),
                 help='путь к access-логу xray; пусто — найти по конфигу ноды (FTB_LOG)')
 AP.add_argument('--ignore-ports', default=os.environ.get('FTB_IGNORE_PORTS', ''),
                 help='доп. порты назначения, не считать веером — через запятую (FTB_IGNORE_PORTS)')
+AP.add_argument('--ignore-nets', default=os.environ.get('FTB_IGNORE_NETS', ''),
+                help='доп. сети (CIDR через запятую), не считать веером — сверх встроенных игровых (FTB_IGNORE_NETS)')
 AP.add_argument('--btguard', choices=['auto', 'on', 'off'], default=os.environ.get('FTB_BTGUARD', 'auto'),
                 help='коррелировать дропы nft-таблицы btguard с клиентами и репортить (FTB_BTGUARD)')
 AP.add_argument('--dry-run', action='store_true', default=os.environ.get('FTB_DRY_RUN', '0') == '1',
@@ -83,6 +86,174 @@ COMMON |= set(range(27000, 27201))  # Steam Datagram Relay и игровые с�
 # и локальные «сигнатурные» порты нод) — их можно занести сюда, не трогая код.
 EXTRA_PORTS = {int(x) for x in re.split(r'[,\s]+', A.ignore_ports.strip()) if x.isdigit()}
 COMMON |= EXTRA_PORTS
+
+
+# Игровые сети (Valve/Steam, Blizzard, Riot): их UDP — релейный веер, неотличимый от
+# торрента по порогу (Steam Datagram Relay бьёт по десяткам релеев на разных портах).
+# Собрано из BGP-анонсов AS32590/AS57976/AS6507 (RIPEstat), схлопнуто. Расширяется через
+# FTB_IGNORE_NETS. Торрент к этим сетям не ходит, так что вырезать их из счёта безопасно.
+GAME_NETS = """
+5.42.160.0/20
+5.42.176.0/22
+24.105.0.0/22
+24.105.16.0/22
+24.105.25.0/24
+24.105.27.0/24
+24.105.28.0/22
+24.105.32.0/20
+24.105.50.0/23
+24.105.52.0/22
+24.105.56.0/23
+24.105.59.0/24
+24.105.60.0/22
+37.244.0.0/24
+37.244.2.0/23
+37.244.4.0/22
+37.244.8.0/23
+37.244.10.0/24
+37.244.13.0/24
+37.244.14.0/23
+37.244.16.0/23
+37.244.19.0/24
+37.244.20.0/24
+37.244.23.0/24
+37.244.24.0/21
+37.244.32.0/22
+37.244.36.0/23
+37.244.38.0/24
+37.244.40.0/21
+37.244.50.0/24
+37.244.52.0/22
+37.244.56.0/21
+43.229.64.0/22
+45.7.36.0/22
+45.121.184.0/24
+45.250.208.0/22
+59.153.40.0/22
+64.224.0.0/21
+64.224.24.0/21
+66.40.176.0/20
+103.4.114.0/23
+103.10.124.0/23
+103.28.54.0/24
+103.198.32.0/23
+103.219.128.0/22
+103.240.224.0/22
+104.160.128.0/19
+117.52.6.0/24
+117.52.26.0/23
+117.52.28.0/23
+117.52.33.0/24
+117.52.34.0/23
+117.52.36.0/23
+121.254.137.0/24
+121.254.206.0/23
+121.254.218.0/24
+137.221.64.0/19
+137.221.96.0/20
+137.221.112.0/24
+138.0.12.0/22
+146.66.152.0/24
+146.66.155.0/24
+150.116.9.0/24
+151.106.246.0/23
+151.106.248.0/22
+151.106.252.0/23
+151.106.254.0/24
+155.133.224.0/21
+155.133.236.0/22
+155.133.240.0/23
+155.133.244.0/24
+155.133.246.0/24
+155.133.248.0/22
+155.133.252.0/24
+155.133.254.0/23
+158.115.192.0/20
+158.115.216.0/21
+162.249.72.0/21
+162.254.192.0/21
+182.162.31.0/24
+185.25.180.0/24
+185.25.182.0/23
+185.40.64.0/22
+185.60.112.0/22
+192.64.168.0/21
+192.69.96.0/22
+192.207.0.0/24
+198.74.32.0/22
+198.74.36.0/23
+202.9.66.0/23
+205.196.6.0/24
+208.64.200.0/22
+208.78.164.0/22
+2404:3fc0::/46
+2404:3fc0:8::/47
+2404:3fc0:a::/48
+2602:801:f000::/46
+2602:801:f005::/48
+2602:801:f006::/47
+2602:801:f008::/46
+2602:801:f00d::/48
+2602:801:f00e::/48
+2a01:bc80::/45
+2a01:bc80:8::/46
+2a01:bc80:c::/48
+2a04:82c0::/29
+2a04:e800:5010::/47
+2a04:e800:5014::/48
+2a04:e800:5016::/48
+2a04:e800:5020::/48
+2a04:e800:5023::/48
+2a04:e800:5040::/48
+2a04:e800:5407::/48
+2a04:e802::/32
+"""
+
+
+class NetMatch:
+    """Быстрая проверка принадлежности IP игнор-сетям: слитые int-диапазоны + bisect."""
+
+    def __init__(self, cidrs):
+        v4, v6 = [], []
+        for c in cidrs:
+            c = c.strip()
+            if not c:
+                continue
+            try:
+                n = ipaddress.ip_network(c, strict=False)
+            except ValueError:
+                continue
+            (v4 if n.version == 4 else v6).append((int(n.network_address), int(n.broadcast_address)))
+        self.v4 = self._merge(v4)
+        self.v6 = self._merge(v6)
+        self.v4s = [a for a, _ in self.v4]
+        self.v6s = [a for a, _ in self.v6]
+
+    @staticmethod
+    def _merge(ranges):
+        ranges.sort()
+        out = []
+        for a, b in ranges:
+            if out and a <= out[-1][1] + 1:
+                out[-1] = (out[-1][0], max(out[-1][1], b))
+            else:
+                out.append((a, b))
+        return out
+
+    def __contains__(self, ip):
+        try:
+            a = ipaddress.ip_address(ip.strip('[]'))
+        except ValueError:
+            return False
+        arr, starts = (self.v4, self.v4s) if a.version == 4 else (self.v6, self.v6s)
+        i = bisect.bisect_right(starts, int(a)) - 1
+        return i >= 0 and arr[i][0] <= int(a) <= arr[i][1]
+
+    def __len__(self):
+        return len(self.v4) + len(self.v6)
+
+
+IGNORE_NETS = NetMatch(GAME_NETS.split() + re.split(r'[,\s]+', A.ignore_nets.strip()))
 
 # Источник xray пишет как "from IP:port" и как "from tcp:IP:port". Назначение берём только
 # числовым адресом: пиры идут по голому IP, обычный сёрфинг резолвится в домен. Маршрут в
@@ -492,6 +663,7 @@ def main():
     log(f'{MARK} {VERSION}: окно {A.window}с, порог {A.min_hosts} хостов / {A.min_ports} портов, '
         f'API ноды — {node.kind}'
         + (f', +{len(EXTRA_PORTS)} игнор-портов' if EXTRA_PORTS else '')
+        + (f', {len(IGNORE_NETS)} игнор-сетей' if len(IGNORE_NETS) else '')
         + (', btguard: вкл' if btg else ', btguard: выкл')
         + (', DRY-RUN: в ноду не отправляю' if A.dry_run else ''))
     if btg:
@@ -505,9 +677,10 @@ def main():
             continue
         now = time.time()
         dst, dport, net = m['dst'], int(m['dport']), m['net']
+        ign = dst in IGNORE_NETS       # игровая/доверенная сеть — не считаем веером
 
-        # индекс пир->клиент для корреляции с btguard: любой UDP-поток, до фильтра COMMON
-        if btg and net == 'udp' and is_global(dst):
+        # индекс пир->клиент для корреляции с btguard: UDP, до фильтра COMMON, кроме игровых сетей
+        if btg and net == 'udp' and not ign and is_global(dst):
             with pindex_lock:
                 peer_index[(dst, dport)] = (m['user'], m['cip'], now)
                 if now - prune > 60:
@@ -517,7 +690,7 @@ def main():
                     prune = now
 
         # веерный детект
-        if dport in COMMON or not is_global(dst):
+        if ign or dport in COMMON or not is_global(dst):
             continue
         q = ev[m['user']]
         inbound = ROUTE_SEP.split(m['route'])[0].strip()
