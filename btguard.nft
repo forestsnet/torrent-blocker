@@ -1,0 +1,60 @@
+#!/usr/sbin/nft -f
+# 2026-09-23 — дроп UDP-контрплана торрента по строгим сигнатурам
+#
+# Ловит то, что штатный сниффер xray пропускает по UDP: DHT (BEP 5), uTP-хендшейк
+# (BEP 29) и connect к UDP-трекеру (BEP 15). Шифрованные MSE/PE-пиры сигнатуры не
+# имеют — их добирает веерный детектор fsnt-torrent-blocker.
+#
+# Сигнатуры ужесточены по логике форка Jolymmiles/Xray-core (dht.go/udp_tracker.go,
+# SniffUTP): строгие поля вместо префиксных матчей. На проде это критично — наивный
+# uTP-матч 0x4100 ловит TURN/WebRTC-медиа (в замере 176 ложных пак/90с), строгий — 0.
+# Логи rate-limited (иначе строка на пакет = флуд). Дроп только на выходе: рвём
+# способность клиента искать пиров, вход не трогаем.
+
+table ip btguard
+delete table ip btguard
+table ip btguard {
+	counter dht     { }
+	counter utp     { }
+	counter tracker { }
+
+	chain output {
+		type filter hook output priority filter - 5; policy accept;
+
+		# --- rate-limited лог (без вердикта, проваливается дальше) ---
+		# DHT-запрос "d1:ad2:id20:" и ответ "d1:rd2:id20:" — словарь с 20-байтным node id
+		meta l4proto udp @th,64,96 == 0x64313a6164323a696432303a \
+			limit rate 30/minute burst 10 packets log prefix "btguard-dht: "
+		meta l4proto udp @th,64,96 == 0x64313a7264323a696432303a \
+			limit rate 30/minute burst 10 packets log prefix "btguard-dht: "
+		# UDP-tracker connect (BEP 15): magic + action(байты 8-11)=0
+		meta l4proto udp @th,64,64 == 0x0000041727101980 @th,128,32 == 0x00000000 \
+			limit rate 30/minute burst 10 packets log prefix "btguard-tracker: "
+		# uTP ST_SYN (BEP 29): 0x41, ext0, conn-id!=0, timestamp-diff=0, seq=1
+		meta l4proto udp @th,64,16 == 0x4100 @th,80,16 != 0x0000 \
+			@th,128,32 == 0x00000000 @th,192,16 == 0x0001 \
+			limit rate 30/minute burst 10 packets log prefix "btguard-utp: "
+
+		# --- дроп + счётчик (все совпавшие пакеты) ---
+		meta l4proto udp @th,64,96 == 0x64313a6164323a696432303a counter name "dht" drop
+		meta l4proto udp @th,64,96 == 0x64313a7264323a696432303a counter name "dht" drop
+		meta l4proto udp @th,64,64 == 0x0000041727101980 @th,128,32 == 0x00000000 \
+			counter name "tracker" drop
+		meta l4proto udp @th,64,16 == 0x4100 @th,80,16 != 0x0000 \
+			@th,128,32 == 0x00000000 @th,192,16 == 0x0001 counter name "utp" drop
+	}
+}
+
+table ip6 btguard6
+delete table ip6 btguard6
+table ip6 btguard6 {
+	counter dht { }
+	counter utp { }
+	chain output {
+		type filter hook output priority filter - 5; policy accept;
+		meta l4proto udp @th,64,96 == 0x64313a6164323a696432303a counter name "dht" drop
+		meta l4proto udp @th,64,96 == 0x64313a7264323a696432303a counter name "dht" drop
+		meta l4proto udp @th,64,16 == 0x4100 @th,80,16 != 0x0000 \
+			@th,128,32 == 0x00000000 @th,192,16 == 0x0001 counter name "utp" drop
+	}
+}

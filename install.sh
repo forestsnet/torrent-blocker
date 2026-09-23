@@ -17,7 +17,9 @@ main() {
     local BIN=/usr/local/sbin/$NAME
     local UNIT=/etc/systemd/system/$NAME.service
     local CONF=/etc/default/$NAME
-    local MODE=install DRY="" PURGE=0
+    local BTG_NFT=/etc/nftables.d/btguard.nft
+    local BTG_UNIT=/etc/systemd/system/btguard.service
+    local MODE=install DRY="" PURGE=0 BTG=1
     local o_window="" o_hosts="" o_ports="" o_cooldown="" o_max="" o_iports=""
 
     while [ $# -gt 0 ]; do
@@ -38,6 +40,7 @@ main() {
             --max-reports=*) o_max=${1#*=} ;;
             --ignore-ports)   shift; o_iports=${1-} ;;
             --ignore-ports=*) o_iports=${1#*=} ;;
+            --no-btguard)   BTG=0 ;;
             -h|--help)      usage; return 0 ;;
             *)              die "неизвестный аргумент: $1" ;;
         esac
@@ -61,7 +64,9 @@ main() {
 
     if [ "$MODE" = uninstall ]; then
         systemctl disable --now "$NAME.service" >/dev/null 2>&1 || true
-        rm -f "$BIN" "$UNIT"
+        systemctl disable --now btguard.service >/dev/null 2>&1 || true
+        command -v nft >/dev/null && { nft delete table ip btguard 2>/dev/null; nft delete table ip6 btguard6 2>/dev/null; } || true
+        rm -f "$BIN" "$UNIT" "$BTG_UNIT" "$BTG_NFT"
         [ "$PURGE" = 1 ] && rm -f "$CONF"
         systemctl daemon-reload
         say "удалён$([ "$PURGE" = 1 ] && echo ' вместе с настройками' || echo "; настройки оставлены в $CONF")"
@@ -85,6 +90,29 @@ main() {
     python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$TMP/$NAME" </dev/null \
         || die "детектор повреждён при загрузке — повтори команду"
     install -m 0755 "$TMP/$NAME" "$BIN"
+
+    if [ "$BTG" = 1 ]; then
+        if command -v nft >/dev/null; then
+            install -d -m 0755 /etc/nftables.d
+            btguard_nft > "$TMP/btguard.nft"
+            if nft -c -f "$TMP/btguard.nft" 2>/dev/null; then
+                install -m 0644 "$TMP/btguard.nft" "$BTG_NFT"
+                btguard_unit > "$BTG_UNIT"
+                systemctl daemon-reload
+                systemctl enable btguard.service >/dev/null 2>&1
+                systemctl restart btguard.service
+                if nft list table ip btguard >/dev/null 2>&1; then
+                    say "btguard: nft-дроп DHT/uTP/tracker активен"
+                else
+                    say "btguard: nft-таблица не загрузилась — детектор пойдёт без корреляции"
+                fi
+            else
+                say "btguard: правила не прошли nft -c — пропускаю"
+            fi
+        else
+            say "btguard: нет команды nft — пропускаю (детектор работает по вееру)"
+        fi
+    fi
 
     if [ ! -f "$CONF" ]; then
         config > "$CONF"
@@ -117,7 +145,7 @@ main() {
     if grep -q '^FTB_DRY_RUN=1' "$CONF"; then
         say "работает в DRY-RUN: находки только в журнале. Боевой режим: … | sudo bash -s -- --live"
     else
-        say "работает: находки уходят в Torrent Blocker ноды → бан, бот, вебхук"
+        say "работает: веер + btguard → Torrent Blocker ноды → бан, бот, вебхук"
     fi
     say "журнал: journalctl -u $NAME -f    настройки: $CONF"
 }
@@ -138,6 +166,7 @@ fsnt-torrent-blocker — установка на Remnawave Node
   --cooldown N      не банить тот же IP чаще, сек (300)
   --max-reports N   предохранитель: отчётов в минуту (10)
   --ignore-ports L  доп. порты назначения через запятую, не считать веером
+  --no-btguard      не ставить nft-дроп btguard (только веерный детект по логу)
 EOF
 }
 
@@ -152,6 +181,91 @@ set_conf() {
 
 say() { printf '\033[1m[fsnt-torrent-blocker]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[fsnt-torrent-blocker] %s\033[0m\n' "$*" >&2; exit 1; }
+
+btguard_unit() {
+cat <<'EOF'
+[Unit]
+Description=btguard: drop torrent UDP control-plane (DHT/uTP/tracker)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/btguard.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/btguard.nft
+ExecStop=-/usr/sbin/nft delete table ip btguard
+ExecStop=-/usr/sbin/nft delete table ip6 btguard6
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+btguard_nft() {
+cat <<'BTG_PAYLOAD'
+#!/usr/sbin/nft -f
+# 2026-09-23 — дроп UDP-контрплана торрента по строгим сигнатурам
+#
+# Ловит то, что штатный сниффер xray пропускает по UDP: DHT (BEP 5), uTP-хендшейк
+# (BEP 29) и connect к UDP-трекеру (BEP 15). Шифрованные MSE/PE-пиры сигнатуры не
+# имеют — их добирает веерный детектор fsnt-torrent-blocker.
+#
+# Сигнатуры ужесточены по логике форка Jolymmiles/Xray-core (dht.go/udp_tracker.go,
+# SniffUTP): строгие поля вместо префиксных матчей. На проде это критично — наивный
+# uTP-матч 0x4100 ловит TURN/WebRTC-медиа (в замере 176 ложных пак/90с), строгий — 0.
+# Логи rate-limited (иначе строка на пакет = флуд). Дроп только на выходе: рвём
+# способность клиента искать пиров, вход не трогаем.
+
+table ip btguard
+delete table ip btguard
+table ip btguard {
+	counter dht     { }
+	counter utp     { }
+	counter tracker { }
+
+	chain output {
+		type filter hook output priority filter - 5; policy accept;
+
+		# --- rate-limited лог (без вердикта, проваливается дальше) ---
+		# DHT-запрос "d1:ad2:id20:" и ответ "d1:rd2:id20:" — словарь с 20-байтным node id
+		meta l4proto udp @th,64,96 == 0x64313a6164323a696432303a \
+			limit rate 30/minute burst 10 packets log prefix "btguard-dht: "
+		meta l4proto udp @th,64,96 == 0x64313a7264323a696432303a \
+			limit rate 30/minute burst 10 packets log prefix "btguard-dht: "
+		# UDP-tracker connect (BEP 15): magic + action(байты 8-11)=0
+		meta l4proto udp @th,64,64 == 0x0000041727101980 @th,128,32 == 0x00000000 \
+			limit rate 30/minute burst 10 packets log prefix "btguard-tracker: "
+		# uTP ST_SYN (BEP 29): 0x41, ext0, conn-id!=0, timestamp-diff=0, seq=1
+		meta l4proto udp @th,64,16 == 0x4100 @th,80,16 != 0x0000 \
+			@th,128,32 == 0x00000000 @th,192,16 == 0x0001 \
+			limit rate 30/minute burst 10 packets log prefix "btguard-utp: "
+
+		# --- дроп + счётчик (все совпавшие пакеты) ---
+		meta l4proto udp @th,64,96 == 0x64313a6164323a696432303a counter name "dht" drop
+		meta l4proto udp @th,64,96 == 0x64313a7264323a696432303a counter name "dht" drop
+		meta l4proto udp @th,64,64 == 0x0000041727101980 @th,128,32 == 0x00000000 \
+			counter name "tracker" drop
+		meta l4proto udp @th,64,16 == 0x4100 @th,80,16 != 0x0000 \
+			@th,128,32 == 0x00000000 @th,192,16 == 0x0001 counter name "utp" drop
+	}
+}
+
+table ip6 btguard6
+delete table ip6 btguard6
+table ip6 btguard6 {
+	counter dht { }
+	counter utp { }
+	chain output {
+		type filter hook output priority filter - 5; policy accept;
+		meta l4proto udp @th,64,96 == 0x64313a6164323a696432303a counter name "dht" drop
+		meta l4proto udp @th,64,96 == 0x64313a7264323a696432303a counter name "dht" drop
+		meta l4proto udp @th,64,16 == 0x4100 @th,80,16 != 0x0000 \
+			@th,128,32 == 0x00000000 @th,192,16 == 0x0001 counter name "utp" drop
+	}
+}
+BTG_PAYLOAD
+}
 
 unit() {
 cat <<'EOF'
@@ -193,6 +307,8 @@ FTB_MIN_PORTS=20
 FTB_COOLDOWN=300
 # предохранитель: больше отчётов в минуту — отправка встаёт на паузу на 10 минут
 FTB_MAX_REPORTS_PER_MIN=10
+# коррелировать дропы btguard с клиентами и репортить: auto (если таблица есть) / on / off
+FTB_BTGUARD=auto
 # доп. порты назначения, не считать веером (через запятую), сверх встроенного списка
 FTB_IGNORE_PORTS=
 # путь к access-логу xray; пусто — найти самому по конфигу ноды
@@ -221,9 +337,10 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 
-VERSION = '1.0.0'
+VERSION = '2.0.0'
 MARK = 'fsnt-torrent-blocker'
 
 
@@ -249,6 +366,8 @@ AP.add_argument('--log', default=os.environ.get('FTB_LOG', ''),
                 help='путь к access-логу xray; пусто — найти по конфигу ноды (FTB_LOG)')
 AP.add_argument('--ignore-ports', default=os.environ.get('FTB_IGNORE_PORTS', ''),
                 help='доп. порты назначения, не считать веером — через запятую (FTB_IGNORE_PORTS)')
+AP.add_argument('--btguard', choices=['auto', 'on', 'off'], default=os.environ.get('FTB_BTGUARD', 'auto'),
+                help='коррелировать дропы nft-таблицы btguard с клиентами и репортить (FTB_BTGUARD)')
 AP.add_argument('--dry-run', action='store_true', default=os.environ.get('FTB_DRY_RUN', '0') == '1',
                 help='только писать находки в журнал, в ноду не отправлять (FTB_DRY_RUN=1)')
 AP.add_argument('--selftest', action='store_true', help='проверить связь с нодой без бана и выйти')
@@ -295,6 +414,15 @@ LINE = re.compile(
     r'\[(?P<route>.*)\]\s*email: (?P<user>\S+)\s*$')
 ROUTE_SEP = re.compile(r' (?:==>|->|>>) ')
 CONFIG_ARG = re.compile(rb'^(?:@|http\+unix://)')
+
+# nft-таблица btguard дропает UDP-контрплан торрента (DHT/uTP/tracker) и логирует пир в
+# kernel-лог. Клиента там нет (пакет уже на выходе, после SNAT), но тот же поток есть в
+# access-логе как "udp:<пир>:<порт> email:<клиент>". peer_index держит эту привязку.
+BTG_LINE = re.compile(r'btguard-(?P<kind>dht|utp|tracker):.*?\bDST=(?P<dst>\d{1,3}(?:\.\d{1,3}){3})'
+                      r'.*?\bDPT=(?P<dpt>\d+)')
+PINDEX_TTL = 300
+peer_index = {}
+pindex_lock = threading.Lock()
 
 LOG_CANDIDATES = ['/var/log/remnanode/access/error.log', '/var/log/remnanode/access/access.log',
                   '/var/log/remnanode/access.log', '/var/log/remnanode/error.log',
@@ -543,6 +671,79 @@ def send(node, report):
         'не доставлен: Torrent Blocker выключен'
 
 
+class Reporter:
+    """Общий бан-пайплайн для обоих сигналов (веер и btguard): кулдаун на клиента,
+    предохранитель отчётов/мин и отправка в вебхук — под одним локом, потокобезопасно."""
+
+    def __init__(self, node):
+        self.node = node
+        self.lock = threading.Lock()
+        self.last_ip = {}
+        self.sent = collections.deque()
+        self.paused_until = 0
+
+    def report(self, user, cip, cport, net, dst, dport, inbound, summary, tag):
+        now = time.time()
+        with self.lock:
+            if now - self.last_ip.get(cip, 0) < A.cooldown:
+                return None
+            self.last_ip[cip] = now
+            if A.dry_run:
+                log(f'[dry-run:{tag}] user={user} ip={cip} {summary}')
+                return 'dry-run'
+            while self.sent and self.sent[0] < now - 60:
+                self.sent.popleft()
+            if now < self.paused_until:
+                log(f'[пауза:{tag}] user={user} ip={cip} {summary} — не отправлен')
+                return None
+            if len(self.sent) >= A.max_reports:
+                self.paused_until = now + 600
+                log(f'ПРЕДОХРАНИТЕЛЬ: {len(self.sent)} отчётов/мин — отправка на паузе 10 минут. '
+                    f'Пороги в /etc/default/{MARK}')
+                return None
+            self.sent.append(now)
+            rep = make_report(user, cip, cport, net, dst, dport, inbound, summary)
+            st = send(self.node, rep)
+            log(f'[{tag}] user={user} ip={cip} {summary} -> {st}')
+            return st
+
+
+def btguard_enabled():
+    if A.btguard == 'off':
+        return False
+    if A.btguard == 'on':
+        return True
+    try:
+        r = subprocess.run(['nft', 'list', 'table', 'ip', 'btguard'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def watch_btguard(reporter):
+    """Второй сигнал: kernel-лог дропов btguard -> клиент из peer_index -> тот же вебхук.
+    Ловит UDP-контрплан торрента с точной привязкой к клиенту, дополняя веерный детект."""
+    try:
+        p = subprocess.Popen(['journalctl', '-kf', '-o', 'cat', '--no-pager', '-n', '0'],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, errors='replace')
+    except OSError as e:
+        log(f'btguard: journalctl недоступен ({e}) — корреляция выключена')
+        return
+    for ln in p.stdout:
+        m = BTG_LINE.search(ln)
+        if not m:
+            continue
+        key = (m['dst'], int(m['dpt']))
+        with pindex_lock:
+            hit = peer_index.get(key)
+        if not hit or time.time() - hit[2] > PINDEX_TTL:
+            continue                       # к клиенту не привязали — пропускаем
+        reporter.report(hit[0], hit[1], 0, 'udp', m['dst'], int(m['dpt']), None,
+                        f'btguard {m["kind"]} udp:{m["dst"]}:{m["dpt"]}', m['kind'])
+
+
 def selftest():
     ok = True
     try:
@@ -604,26 +805,42 @@ def main():
         sys.exit(f'нода: {e}')
     if not A.dry_run and not node.webhook:
         sys.exit('вебхука в конфиге xray нет — включи плагин Torrent Blocker на ноде')
+
+    reporter = Reporter(node)
+    btg = btguard_enabled()
     log(f'{MARK} {VERSION}: окно {A.window}с, порог {A.min_hosts} хостов / {A.min_ports} портов, '
         f'API ноды — {node.kind}'
         + (f', +{len(EXTRA_PORTS)} игнор-портов' if EXTRA_PORTS else '')
+        + (', btguard: вкл' if btg else ', btguard: выкл')
         + (', DRY-RUN: в ноду не отправляю' if A.dry_run else ''))
+    if btg:
+        threading.Thread(target=watch_btguard, args=(reporter,), daemon=True).start()
+
     ev = collections.defaultdict(collections.deque)
-    last_ip = {}
-    sent = collections.deque()
-    paused_until = 0
-    sweep = time.time()
+    sweep = prune = time.time()
     for ln in follow(node, A.log):
         m = LINE.search(ln)
         if not m:
             continue
-        dport = int(m['dport'])
-        if dport in COMMON or not is_global(m['dst']):
-            continue
         now = time.time()
+        dst, dport, net = m['dst'], int(m['dport']), m['net']
+
+        # индекс пир->клиент для корреляции с btguard: любой UDP-поток, до фильтра COMMON
+        if btg and net == 'udp' and is_global(dst):
+            with pindex_lock:
+                peer_index[(dst, dport)] = (m['user'], m['cip'], now)
+                if now - prune > 60:
+                    cut = now - PINDEX_TTL
+                    for k in [k for k, v in peer_index.items() if v[2] < cut]:
+                        del peer_index[k]
+                    prune = now
+
+        # веерный детект
+        if dport in COMMON or not is_global(dst):
+            continue
         q = ev[m['user']]
         inbound = ROUTE_SEP.split(m['route'])[0].strip()
-        q.append((now, m['cip'], int(m['cport']), m['dst'], dport, m['net'], inbound))
+        q.append((now, m['cip'], int(m['cport']), dst, dport, net, inbound))
         while q and q[0][0] < now - A.window:
             q.popleft()
         if now - sweep > A.window:
@@ -635,31 +852,13 @@ def main():
         if len(hosts) < A.min_hosts or len(ports) < A.min_ports:
             continue
         cip = collections.Counter(x[1] for x in q).most_common(1)[0][0]
-        if now - last_ip.get(cip, 0) < A.cooldown:
-            continue
-        last_ip[cip] = now
         nets = collections.Counter(x[5] for x in q)
         ex = next(x for x in reversed(q) if x[1] == cip)
         summary = (f'fanout {len(hosts)} hosts / {len(ports)} ports / {len(q)} conns in '
                    f'{A.window}s (tcp {nets["tcp"]}, udp {nets["udp"]})')
-        user = m['user']
-        q.clear()
-        if A.dry_run:
-            log(f'[dry-run] user={user} ip={cip} {summary}')
-            continue
-        while sent and sent[0] < now - 60:
-            sent.popleft()
-        if now < paused_until:
-            log(f'[пауза] user={user} ip={cip} {summary} — не отправлен')
-            continue
-        if len(sent) >= A.max_reports:
-            paused_until = now + 600
-            log(f'ПРЕДОХРАНИТЕЛЬ: {len(sent)} отчётов за минуту — отправка приостановлена на 10 минут. '
-                f'Проверь пороги в /etc/default/{MARK}')
-            continue
-        sent.append(now)
-        rep = make_report(user, cip, ex[2], nets.most_common(1)[0][0], ex[3], ex[4], ex[6], summary)
-        log(f'user={user} ip={cip} {summary} -> {send(node, rep)}')
+        if reporter.report(m['user'], cip, ex[2], nets.most_common(1)[0][0],
+                           ex[3], ex[4], ex[6], summary, 'веер') is not None:
+            q.clear()
 
 
 if __name__ == '__main__':
