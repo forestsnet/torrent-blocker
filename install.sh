@@ -217,7 +217,7 @@ TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
 curl -fsSL --max-time 90 "$RAW" -o "$TMP" || { echo "update: GitHub недоступен"; exit 0; }
 bash -n "$TMP" 2>/dev/null || { echo "update: загруженный installer невалиден — пропуск"; exit 0; }
 grep -q "FTB_PAYLOAD" "$TMP" || { echo "update: installer без payload — пропуск"; exit 0; }
-remote="$(grep -m1 "VERSION = '" "$TMP" | sed "s/.*VERSION = '\([^']*\)'.*/\1/")"
+remote="$(grep -m1 "^VERSION = '" "$TMP" | sed "s/.*VERSION = '\([^']*\)'.*/\1/")"
 local="$("$BIN" --version 2>/dev/null | awk '{print $2}')"
 if [ -n "$remote" ] && [ "$remote" = "$local" ]; then
     echo "update: уже $local — обновление не требуется"; exit 0
@@ -417,7 +417,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.2.0'
+VERSION = '2.2.1'
 MARK = 'fsnt-torrent-blocker'
 
 
