@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.2.1'
+VERSION = '2.2.2'
 MARK = 'fsnt-torrent-blocker'
 
 

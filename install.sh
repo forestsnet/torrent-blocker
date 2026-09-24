@@ -219,10 +219,16 @@ bash -n "$TMP" 2>/dev/null || { echo "update: загруженный installer �
 grep -q "FTB_PAYLOAD" "$TMP" || { echo "update: installer без payload — пропуск"; exit 0; }
 remote="$(grep -m1 "^VERSION = '" "$TMP" | sed "s/.*VERSION = '\([^']*\)'.*/\1/")"
 local="$("$BIN" --version 2>/dev/null | awk '{print $2}')"
-if [ -n "$remote" ] && [ "$remote" = "$local" ]; then
-    echo "update: уже $local — обновление не требуется"; exit 0
+[ -z "$remote" ] && { echo "update: версия из installer не прочитана — пропуск"; exit 0; }
+if [ "$remote" = "$local" ]; then
+    echo "update: уже $local — актуально"; exit 0
 fi
-echo "update: $local -> ${remote:-?}, переустанавливаю"
+# обновляем ТОЛЬКО если удалённая строго новее (устаревший кэш GitHub иначе откатил бы версию)
+newest="$(printf '%s\n%s\n' "$local" "$remote" | sort -V | tail -1)"
+if [ "$newest" != "$remote" ]; then
+    echo "update: локальная $local не старше удалённой $remote (кэш GitHub?) — пропуск"; exit 0
+fi
+echo "update: $local -> $remote, обновляю"
 bash "$TMP"        # реинсталл; существующий конфиг сохраняется
 EOF
 }
@@ -417,7 +423,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.2.1'
+VERSION = '2.2.2'
 MARK = 'fsnt-torrent-blocker'
 
 
