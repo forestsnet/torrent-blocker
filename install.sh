@@ -8,6 +8,7 @@
 #   curl -fsSL …/install.sh | sudo bash -s -- --uninstall           удалить (--purge — вместе с настройками)
 #   ssh deploy@host 'sudo bash -s' < install.sh                     то же без доступа сервера к GitHub
 #
+# Ежедневное авто-обновление с GitHub включается по умолчанию (--no-autoupdate отключает).
 # Пороги можно задать флагами при установке и потом править в /etc/default/fsnt-torrent-blocker.
 # Детектор вшит в этот файл целиком: сборка — ./build.sh из fsnt-torrent-blocker.py.
 
@@ -19,7 +20,10 @@ main() {
     local CONF=/etc/default/$NAME
     local BTG_NFT=/etc/nftables.d/btguard.nft
     local BTG_UNIT=/etc/systemd/system/btguard.service
-    local MODE=install DRY="" PURGE=0 BTG=1
+    local UPD_BIN=/usr/local/sbin/$NAME-update
+    local UPD_SVC=/etc/systemd/system/$NAME-update.service
+    local UPD_TIMER=/etc/systemd/system/$NAME-update.timer
+    local MODE=install DRY="" PURGE=0 BTG=1 AU=1
     local o_window="" o_hosts="" o_ports="" o_cooldown="" o_max="" o_iports="" o_inets=""
 
     while [ $# -gt 0 ]; do
@@ -43,6 +47,7 @@ main() {
             --ignore-nets)    shift; o_inets=${1-} ;;
             --ignore-nets=*)  o_inets=${1#*=} ;;
             --no-btguard)   BTG=0 ;;
+            --no-autoupdate) AU=0 ;;
             -h|--help)      usage; return 0 ;;
             *)              die "неизвестный аргумент: $1" ;;
         esac
@@ -67,8 +72,9 @@ main() {
     if [ "$MODE" = uninstall ]; then
         systemctl disable --now "$NAME.service" >/dev/null 2>&1 || true
         systemctl disable --now btguard.service >/dev/null 2>&1 || true
+        systemctl disable --now "$NAME-update.timer" >/dev/null 2>&1 || true
         command -v nft >/dev/null && { nft delete table ip btguard 2>/dev/null; nft delete table ip6 btguard6 2>/dev/null; } || true
-        rm -f "$BIN" "$UNIT" "$BTG_UNIT" "$BTG_NFT"
+        rm -f "$BIN" "$UNIT" "$BTG_UNIT" "$BTG_NFT" "$UPD_BIN" "$UPD_SVC" "$UPD_TIMER"
         [ "$PURGE" = 1 ] && rm -f "$CONF"
         systemctl daemon-reload
         say "удалён$([ "$PURGE" = 1 ] && echo ' вместе с настройками' || echo "; настройки оставлены в $CONF")"
@@ -114,6 +120,17 @@ main() {
         else
             say "btguard: нет команды nft — пропускаю (детектор работает по вееру)"
         fi
+    fi
+
+    if [ "$AU" = 1 ] && command -v curl >/dev/null; then
+        update_script > "$UPD_BIN"; chmod 0755 "$UPD_BIN"
+        update_service > "$UPD_SVC"
+        update_timer > "$UPD_TIMER"
+        systemctl daemon-reload
+        systemctl enable --now "$NAME-update.timer" >/dev/null 2>&1
+        say "авто-обновление с GitHub: вкл (ежедневно). Выкл: systemctl disable --now $NAME-update.timer"
+    elif [ "$AU" = 1 ]; then
+        say "авто-обновление: нет curl — пропускаю"
     fi
 
     if [ ! -f "$CONF" ]; then
@@ -171,6 +188,7 @@ fsnt-torrent-blocker — установка на Remnawave Node
   --ignore-ports L  доп. порты назначения через запятую, не считать веером
   --ignore-nets L   доп. сети CIDR через запятую, не считать веером (сверх игровых)
   --no-btguard      не ставить nft-дроп btguard (только веерный детект по логу)
+  --no-autoupdate   не включать ежедневное авто-обновление с GitHub
 EOF
 }
 
@@ -185,6 +203,58 @@ set_conf() {
 
 say() { printf '\033[1m[fsnt-torrent-blocker]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[fsnt-torrent-blocker] %s\033[0m\n' "$*" >&2; exit 1; }
+
+update_script() {
+cat <<'EOF'
+#!/usr/bin/env bash
+# Авто-обновление fsnt-torrent-blocker с GitHub. Тянет свежий install.sh, сверяет версию,
+# при отличии — переустанавливает (конфиг /etc/default сохраняется). Битую загрузку и
+# недоступность GitHub переживает молча (exit 0), сервис не трогает.
+set -euo pipefail
+RAW="https://raw.githubusercontent.com/forestsnet/torrent-blocker/main/install.sh"
+BIN=/usr/local/sbin/fsnt-torrent-blocker
+TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+curl -fsSL --max-time 90 "$RAW" -o "$TMP" || { echo "update: GitHub недоступен"; exit 0; }
+bash -n "$TMP" 2>/dev/null || { echo "update: загруженный installer невалиден — пропуск"; exit 0; }
+grep -q "FTB_PAYLOAD" "$TMP" || { echo "update: installer без payload — пропуск"; exit 0; }
+remote="$(grep -m1 "VERSION = '" "$TMP" | sed "s/.*VERSION = '\([^']*\)'.*/\1/")"
+local="$("$BIN" --version 2>/dev/null | awk '{print $2}')"
+if [ -n "$remote" ] && [ "$remote" = "$local" ]; then
+    echo "update: уже $local — обновление не требуется"; exit 0
+fi
+echo "update: $local -> ${remote:-?}, переустанавливаю"
+bash "$TMP"        # реинсталл; существующий конфиг сохраняется
+EOF
+}
+
+update_service() {
+cat <<'EOF'
+[Unit]
+Description=fsnt-torrent-blocker auto-update from GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fsnt-torrent-blocker-update
+SyslogIdentifier=fsnt-torrent-blocker-update
+EOF
+}
+
+update_timer() {
+cat <<'EOF'
+[Unit]
+Description=Daily fsnt-torrent-blocker auto-update
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
 
 btguard_unit() {
 cat <<'EOF'
@@ -347,7 +417,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.1.0'
+VERSION = '2.2.0'
 MARK = 'fsnt-torrent-blocker'
 
 
