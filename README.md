@@ -76,10 +76,15 @@ curl -fsSL https://raw.githubusercontent.com/forestsnet/torrent-blocker/main/ins
     missingok
     notifempty
     copytruncate
+    su root root
 }
 ```
 
 Детектор переживает ротацию сам (следит за inode и усечением, переоткрывает файл). `copytruncate` предпочтителен: не рвёт запись xray в уже открытый дескриптор.
+
+> **`su root root` не для галочки.** Если каталог `/var/log/remnanode` создан контейнером как world-/group-writable, logrotate 3.x **молча пропускает** лог (`error: skipping … parent directory has insecure permissions`) — ротация не идёт вовсе, а в отладке видно `Creating new state` вместо `rotating`. Директива `su root root` снимает эту проверку. Убедиться, что ротация реально работает: `logrotate -d /etc/logrotate.d/<файл>` — в выводе не должно быть `skipping`.
+>
+> `delaycompress` с `copytruncate` не нужен: ротированный файл — уже статичная копия, сжимается сразу. `delaycompress` лишь держит самую свежую ротацию несжатой, а на болтливом `error.log` это гигабайты впустую.
 
 ## Установка
 
