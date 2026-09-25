@@ -52,8 +52,34 @@ curl -fsSL https://raw.githubusercontent.com/forestsnet/torrent-blocker/main/ins
 ## Требования
 
 - Remnawave Node **2.7.0+**, плагин Torrent Blocker включён (нода с `cap_add: NET_ADMIN`)
-- access-лог xray не выключен: `log.access` ≠ `"none"`
+- **В профиле ноды заданы пути логов** — детектор читает access-лог в реальном времени:
+
+  ```json
+  "log": {
+    "access": "/var/log/remnanode/access.log",
+    "error": "/var/log/remnanode/error.log"
+  }
+  ```
+
+  Без `log.access` (или при `"none"`) веерному детектору не с чем работать — selftest это покажет (`access-лог не найден`). Задаётся в профиле ноды в панели. Nft-дроп **btguard** при этом работает и без лога.
 - systemd, root, python3 **3.6+** (если python3 нет, установщик поставит его сам — стандартной библиотеки достаточно, внешних зависимостей нет)
+
+### Ротация логов
+
+Детектор сканирует access-лог **в реальном времени** (`tail`) — хранить его долго незачем, ротацию можно ставить агрессивную. Если лог растёт быстро, включи logrotate на ноде:
+
+```
+/var/log/remnanode/*.log {
+    hourly
+    rotate 3
+    size 100M
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
+Детектор переживает ротацию сам (следит за inode и усечением, переоткрывает файл). `copytruncate` предпочтителен: не рвёт запись xray в уже открытый дескриптор.
 
 ## Установка
 
