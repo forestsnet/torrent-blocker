@@ -218,3 +218,7 @@ curl -fsSL …/install.sh | sudo bash -s -- --uninstall --purge   # вместе
 ./build.sh           # пересобрать install.sh
 ./build.sh --check   # проверить, что install.sh собран из текущего .py (для CI/хука)
 ```
+
+## Лицензия
+
+MIT © ForestsNet LTD — см. [LICENSE](LICENSE).
