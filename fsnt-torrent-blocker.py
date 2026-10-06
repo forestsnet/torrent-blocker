@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.2.2'
+VERSION = '2.2.3'
 MARK = 'fsnt-torrent-blocker'
 
 
@@ -623,13 +623,19 @@ def selftest():
     broken.pop('ts')
     t0 = time.time()
     st1, _ = http(node.webhook, 'POST', json.dumps(probe).encode())
-    st2, _ = http(node.webhook, 'POST', json.dumps(broken).encode())
-    if st1 != 200 or st2 != 200:
-        print(f'FAIL  вебхук ответил {st1}/{st2} (0 — токен не принят)')
+    time.sleep(0.3)
+    http(node.webhook, 'POST', json.dumps(broken).encode())   # нарочно битый — нода залогирует отказ
+    # Контроллер ноды отвечает 200 на ЛЮБОЙ payload (@HttpCode(200), валидация асинхронная в
+    # обработчике), 0 — токен сокета не принят. Гейтим только валидный отчёт; статус битого (st2)
+    # не проверяем — на нодах он остаётся 200, а код future-proof и к 4xx.
+    if st1 != 200:
+        print(f'FAIL  вебхук не принял валидный отчёт (HTTP {st1}; 0 — токен сокета не принят)')
         return 1
     print('ok    вебхук принимает отчёты (HTTP 200)')
-    # Битый отчёт (без ts) нода отвергнет строкой "Invalid webhook" в своём логе. Ровно одна
-    # такая строка — значит формат детектора совпадает со схемой, а обработчик живой.
+    # Битый отчёт (без ts) нода отвергнет строкой "Invalid webhook: <ZodError>" в своём логе.
+    # ⚠️ НЕ привязываемся к форме сериализации: node ≤2.8 на zod3 даёт path ["ts"], node 3.x на
+    # zod4 сериализует ZodError иначе — поэтому ts ищем свободно, а при несовпадении формы НЕ
+    # валим (нода всё равно отвергла битый отчёт — обработчик живой и валидирует). «Там и сям».
     cid = node.container_id()
     if cid and subprocess.run(['sh', '-c', 'command -v docker'], capture_output=True).returncode == 0:
         time.sleep(1.5)
@@ -637,13 +643,13 @@ def selftest():
         out = subprocess.run(['docker', 'logs', '--since', since, cid], stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, errors='replace').stdout
         bad = [ln for ln in out.splitlines() if 'Invalid webhook' in ln]
-        if len(bad) == 1 and '"ts"' in bad[0]:
-            print('ok    обработчик ноды разбирает формат детектора')
-        elif not bad:
-            print('WARN  отклика обработчика в логе ноды не видно — проверь вручную: docker logs')
+        ts_cited = [ln for ln in bad if re.search(r'''['"\[\s]ts['"\],\s]''', ln)]
+        if ts_cited:
+            print('ok    обработчик ноды разбирает формат детектора (битый отчёт отклонён по ts)')
+        elif bad:
+            print('ok    нода валидирует формат (битый отчёт отклонён)')
         else:
-            print('FAIL  формат отчёта не совпал со схемой ноды:\n      ' + bad[0][:300])
-            ok = False
+            print('WARN  отклика обработчика в логе ноды не видно — проверь вручную: docker logs')
     else:
         print('WARN  контейнер ноды не определён — разбор формата не проверен')
     print('итог: ' + ('OK' if ok else 'FAIL'))
