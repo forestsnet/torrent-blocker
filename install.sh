@@ -423,7 +423,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.2.3'
+VERSION = '2.2.4'
 MARK = 'fsnt-torrent-blocker'
 
 
@@ -1118,7 +1118,8 @@ def main():
         if now - sweep > A.window:
             for u in [u for u, d in ev.items() if not d or d[-1][0] < now - A.window]:
                 del ev[u]
-            for u in [u for u, d in ev_gi.items() if not d or d[-1][0] < now - A.window]:
+            # ev_gi хранит float-таймстампы (gq.append(now)), не кортежи как ev — сравниваем сам d[-1]
+            for u in [u for u, d in ev_gi.items() if not d or d[-1] < now - A.window]:
                 del ev_gi[u]
             sweep = now
         hosts = {x[3] for x in q}
