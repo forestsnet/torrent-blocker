@@ -423,7 +423,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.2.4'
+VERSION = '2.2.5'
 MARK = 'fsnt-torrent-blocker'
 
 
@@ -893,15 +893,20 @@ def is_global(ip):
         return False
 
 
-def make_report(user, cip, cport, net, dst, dport, inbound, summary):
+def make_report(user, cip, cport, net, dst, dport, inbound, summary, tag=None):
     # Все 13 ключей XrayWebhookSchema обязательны: nullable, но не optional.
     # protocol и outboundTag = MARK — по ним отчёты детектора отличаются от нативных в боте
-    # ("Protocol: fsnt-torrent-blocker") и в фильтре отчётов панели.
+    # ("Protocol: fsnt-torrent-blocker") и в фильтре отчётов панели, НЕ трогать.
+    # inboundName/inboundLocal — свободные nullable-строки схемы: кладём сигнал и режим+версию.
+    # Их отдаёт внешний webhook torrent_blocker.report и раскрытие строки в панели; в телеграм-
+    # шаблоне бэкенда их нет (он читает только protocol/network/destination/inboundTag).
     return {
         'email': user, 'level': 0, 'protocol': MARK, 'network': net,
         'source': f'{cip}:{cport}', 'destination': f'{dst}:{dport}',
         'routeTarget': summary, 'originalTarget': f'{net}:{dst}:{dport}',
-        'inboundTag': inbound or None, 'inboundName': None, 'inboundLocal': None,
+        'inboundTag': inbound or None,
+        'inboundName': (f'fsnt:{tag}' if tag else None),
+        'inboundLocal': f'ftb{VERSION} ' + ('dry-run' if A.dry_run else 'live'),
         'outboundTag': MARK, 'ts': int(time.time()),
     }
 
@@ -957,7 +962,7 @@ class Reporter:
                     f'Пороги в /etc/default/{MARK}')
                 return None
             self.sent.append(now)
-            rep = make_report(user, cip, cport, net, dst, dport, inbound, summary)
+            rep = make_report(user, cip, cport, net, dst, dport, inbound, summary, tag)
             st = send(self.node, rep)
             log(f'[{tag}] user={user} ip={cip} {summary} -> {st}'
                 + (f' | {detail}' if detail else ''))
@@ -996,7 +1001,8 @@ def watch_btguard(reporter):
             hit = peer_index.get(key)
         if not hit or time.time() - hit[2] > PINDEX_TTL:
             continue                       # к клиенту не привязали — пропускаем
-        reporter.report(hit[0], hit[1], 0, 'udp', m['dst'], int(m['dpt']), None,
+        reporter.report(hit[0], hit[1], 0, 'udp', m['dst'], int(m['dpt']),
+                        (hit[3] if len(hit) > 3 else None),
                         f'btguard {m["kind"]} udp:{m["dst"]}:{m["dpt"]}', m['kind'])
 
 
@@ -1093,7 +1099,9 @@ def main():
         # индекс пир->клиент для корреляции с btguard: UDP, до фильтра COMMON, кроме игровых сетей
         if btg and net == 'udp' and not ign and is_global(dst):
             with pindex_lock:
-                peer_index[(dst, dport)] = (m['user'], m['cip'], now)
+                # 4-й элемент — inbound клиента (из route access-лога): даёт btguard-хиту
+                # настоящий inboundTag (раньше был null), виден и в телеграме, и в панели
+                peer_index[(dst, dport)] = (m['user'], m['cip'], now, ROUTE_SEP.split(m['route'])[0].strip())
                 if now - prune > 60:
                     cut = now - PINDEX_TTL
                     for k in [k for k, v in peer_index.items() if v[2] < cut]:
