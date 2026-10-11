@@ -11,6 +11,7 @@
 import argparse
 import bisect
 import collections
+import concurrent.futures
 import ipaddress
 import json
 import os
@@ -21,7 +22,7 @@ import sys
 import threading
 import time
 
-VERSION = '2.2.5'
+VERSION = '2.3.0'
 MARK = 'fsnt-torrent-blocker'
 
 
@@ -29,6 +30,13 @@ def env_int(name, default):
     try:
         return int(os.environ.get(name, default))
     except ValueError:
+        return default
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
         return default
 
 
@@ -53,9 +61,26 @@ AP.add_argument('--btguard', choices=['auto', 'on', 'off'], default=os.environ.g
                 help='коррелировать дропы nft-таблицы btguard с клиентами и репортить (FTB_BTGUARD)')
 AP.add_argument('--dry-run', action='store_true', default=os.environ.get('FTB_DRY_RUN', '0') == '1',
                 help='только писать находки в журнал, в ноду не отправлять (FTB_DRY_RUN=1)')
+AP.add_argument('--veer-tiering', choices=['on', 'off'],
+                default=os.environ.get('FTB_VEER_TIERING', 'on'),
+                help='различать веер-ложняки: дата-центровый рой и неподтверждённый веер '
+                     'не банить сразу, btguard-сигнатура банит всегда (FTB_VEER_TIERING)')
+AP.add_argument('--dc-min-fraction', type=float,
+                default=env_float('FTB_DC_MIN_FRACTION', 0.8),
+                help='доля дата-центровых пиров в рое, выше которой веер не считаем '
+                     'торрентом (FTB_DC_MIN_FRACTION)')
+AP.add_argument('--dc-nets', default=os.environ.get('FTB_DC_NETS', ''),
+                help='дата-центр-сети (CIDR через запятую), чьи пиры считать хостинговыми '
+                     'сверх rDNS — для пиров без PTR (FTB_DC_NETS)')
+AP.add_argument('--veer-persist', type=int, default=env_int('FTB_VEER_PERSIST', 2),
+                help='сколько веер-срабатываний за окно повтора, чтобы забанить '
+                     'неподтверждённый резидентный веер (FTB_VEER_PERSIST)')
+AP.add_argument('--veer-persist-window', type=int,
+                default=env_int('FTB_VEER_PERSIST_WINDOW', 900),
+                help='окно подсчёта повторов веера, сек (FTB_VEER_PERSIST_WINDOW)')
 AP.add_argument('--selftest', action='store_true', help='проверить связь с нодой без бана и выйти')
 AP.add_argument('--version', action='version', version=f'{MARK} {VERSION}')
-A = AP.parse_args()
+A = AP.parse_args([] if __name__ != '__main__' else None)
 
 # Порты, где веер к разным адресам — норма, а не торрент. Список подобран по типовому
 # легальному трафику (см. README, раздел «Встроенный список портов») и расширяется через
@@ -255,6 +280,22 @@ class NetMatch:
 
 IGNORE_NETS = NetMatch(GAME_NETS.split() + re.split(r'[,\s]+', A.ignore_nets.strip()))
 
+# Различение веер-ложняка: торрент-рой — это домашние IP случайных провайдеров, а relay/mesh/
+# remote-access-приложения (Tailscale, RustDesk, p2p-звонки) фанаутят к флоту VPS. Если «веер»
+# почти весь дата-центровый и btguard-сигнатура молчит — это не торрент. Признак пира берём из
+# rDNS (дженерик-паттерны хостеров против консьюмерских), а FTB_DC_NETS закрывает пиров без PTR.
+# Список НАМЕРЕННО без вшитых хостинг-диапазонов: они огромны и протухают, а неверный CIDR даст
+# ложную классификацию. Непокрытых пиров добирает тир повтора (persist) — он ложно не банит.
+DC_NETS = NetMatch(re.split(r'[,\s]+', A.dc_nets.strip()))
+DC_RE = re.compile(
+    r'your-server\.de|hetzner|contabo|\bovh\b|ovh\.net|googleusercontent|amazonaws|'
+    r'\.compute\.|compute-|cloudapp|\bazure\b|digitalocean|\bdo-|linode|vultr|choopa|'
+    r'netcup|powersrv|leaseweb|hostkey|scaleway|hostinger|oraclecloud|\bvps\b|vmi\d|'
+    r'\bdedi\b|\bcolo\b|datacenter|\bservers?\b', re.I)
+RES_RE = re.compile(
+    r'dynamic|\bdyn\b|\badsl\b|\bdsl\b|pppoe|\bppp\b|\bpool\b|broadband|\bcable\b|'
+    r'\bdhcp\b|fib(?:er|re)|\blte\b|residential|\bhome\b|\bdial\b|\bcpe\b|subscriber', re.I)
+
 # Источник xray пишет как "from IP:port" и как "from tcp:IP:port". Назначение берём только
 # числовым адресом: пиры идут по голому IP, обычный сёрфинг резолвится в домен. Маршрут в
 # скобках бывает со вложенными скобками ("[VLESS TCP REALITY [flow] -> warp-de-2]"), поэтому
@@ -275,6 +316,12 @@ BTG_LINE = re.compile(r'btguard-(?P<kind>dht|utp|tracker):.*?\bDST=(?P<dst>\d{1,
 PINDEX_TTL = 300
 peer_index = {}
 pindex_lock = threading.Lock()
+
+# Подтверждение веера строгой сигнатурой: когда btguard дропнул DHT/uTP/tracker по клиенту,
+# помечаем время. Веер по тому же клиенту в пределах VEER_CONFIRM_WINDOW = точно торрент → бан.
+btg_recent = {}
+btg_recent_lock = threading.Lock()
+VEER_CONFIRM_WINDOW = 600
 
 LOG_CANDIDATES = ['/var/log/remnanode/access/error.log', '/var/log/remnanode/access/access.log',
                   '/var/log/remnanode/access.log', '/var/log/remnanode/error.log',
@@ -491,6 +538,92 @@ def is_global(ip):
         return False
 
 
+_rdns_cache = {}            # ip -> (verdict, expiry) — rDNS дорогой, кэшируем вердикт
+_rdns_lock = threading.Lock()
+RDNS_TTL = 12 * 3600
+
+
+def rdns_name(ip):
+    try:
+        return socket.gethostbyaddr(ip.strip('[]'))[0]
+    except (OSError, IndexError):
+        return ''
+
+
+def host_verdict(ptr, ip, dc_nets):
+    """'dc' | 'res' | 'unknown' по одному пиру. FTB_DC_NETS важнее rDNS — закрывает пиров без
+    PTR. В rDNS дата-центр проверяем РАНЬШЕ резидента: у хостеров PTR бывает с консьюмерскими
+    словами ('clients.your-server.de'), а наоборот почти не бывает."""
+    if ip in dc_nets:
+        return 'dc'
+    if not ptr:
+        return 'unknown'
+    if DC_RE.search(ptr):
+        return 'dc'
+    if RES_RE.search(ptr):
+        return 'res'
+    return 'unknown'
+
+
+def classify_hosts(hosts, resolve=rdns_name, dc_nets=None, deadline=2.0, workers=12):
+    """Классифицирует пиров роя на (dc, res, unknown). rDNS-резолв только для незакэшированных,
+    параллельно и с общим дедлайном — срабатывает редко (порог рвётся нечасто), не в hot-path."""
+    if dc_nets is None:
+        dc_nets = DC_NETS
+    hosts = list(dict.fromkeys(hosts))
+    now = time.time()
+    verdict, todo = {}, []
+    for ip in hosts:
+        if ip in dc_nets:
+            verdict[ip] = 'dc'
+            continue
+        with _rdns_lock:
+            c = _rdns_cache.get(ip)
+        if c and c[1] > now:
+            verdict[ip] = c[0]
+        else:
+            todo.append(ip)
+    if todo:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(todo)))
+        futs = {pool.submit(resolve, ip): ip for ip in todo}
+        done, pending = concurrent.futures.wait(futs, timeout=deadline)
+        for f in done:
+            ip = futs[f]
+            try:
+                v = host_verdict(f.result(), ip, dc_nets)
+            except Exception:
+                v = 'unknown'
+            verdict[ip] = v
+            with _rdns_lock:
+                _rdns_cache[ip] = (v, now + RDNS_TTL)
+        for f in pending:
+            verdict[futs[f]] = 'unknown'      # резолвер не успел к дедлайну — не знаем
+            f.cancel()
+        pool.shutdown(wait=False)
+    dc = sum(1 for v in verdict.values() if v == 'dc')
+    res = sum(1 for v in verdict.values() if v == 'res')
+    return dc, res, len(verdict) - dc - res
+
+
+def decide_veer(dc, res, unknown, btguard_recent, trips,
+                tiering=True, dc_min_fraction=0.8, veer_persist=2):
+    """Решение по веер-срабатыванию: 'ban' | 'suppress' | 'suspect'.
+    btguard_recent — была ли строгая торрент-сигнатура по клиенту недавно; trips — счётчик
+    веер-срабатываний в окне повтора, включая текущее. Чистая функция, тестируется отдельно."""
+    if not tiering:
+        return 'ban'
+    if btguard_recent:
+        return 'ban'                              # подтверждённый торрент
+    total = dc + res + unknown
+    coverage = (dc + res) / total if total else 0.0
+    frac = dc / (dc + res) if (dc + res) else 0.0
+    if coverage >= 0.6 and frac >= dc_min_fraction:
+        return 'suppress'                         # дата-центровый рой — не торрент
+    if trips >= veer_persist:
+        return 'ban'                              # резидентный, подтверждён повтором
+    return 'suspect'                              # мягко: ждём повтора
+
+
 def make_report(user, cip, cport, net, dst, dport, inbound, summary, tag=None):
     # Все 13 ключей XrayWebhookSchema обязательны: nullable, но не optional.
     # protocol и outboundTag = MARK — по ним отчёты детектора отличаются от нативных в боте
@@ -599,6 +732,8 @@ def watch_btguard(reporter):
             hit = peer_index.get(key)
         if not hit or time.time() - hit[2] > PINDEX_TTL:
             continue                       # к клиенту не привязали — пропускаем
+        with btg_recent_lock:
+            btg_recent[hit[0]] = time.time()   # строгая сигнатура по клиенту — подтверждает веер
         reporter.report(hit[0], hit[1], 0, 'udp', m['dst'], int(m['dpt']),
                         (hit[3] if len(hit) > 3 else None),
                         f'btguard {m["kind"]} udp:{m["dst"]}:{m["dpt"]}', m['kind'])
@@ -685,6 +820,8 @@ def main():
 
     ev = collections.defaultdict(collections.deque)
     ev_gi = collections.defaultdict(collections.deque)   # игровые (игнор) соединения — для доказательства
+    veer_last = {}                                       # user -> время последнего разбора веера (анти-спам)
+    veer_trips = collections.defaultdict(collections.deque)   # user -> времена веер-срабатываний (тир повтора)
     sweep = prune = time.time()
     for ln in follow(node, A.log):
         m = LINE.search(ln)
@@ -727,6 +864,11 @@ def main():
             # ev_gi хранит float-таймстампы (gq.append(now)), не кортежи как ev — сравниваем сам d[-1]
             for u in [u for u, d in ev_gi.items() if not d or d[-1] < now - A.window]:
                 del ev_gi[u]
+            # тир повтора живёт дольше окна (persist-window) — чистим по нему, чтобы словари не росли
+            for u in [u for u, t in list(veer_last.items()) if now - t > A.veer_persist_window]:
+                del veer_last[u]
+            for u in [u for u, d in veer_trips.items() if not d or d[-1] < now - A.veer_persist_window]:
+                del veer_trips[u]
             sweep = now
         hosts = {x[3] for x in q}
         ports = {x[4] for x in q}
@@ -743,10 +885,37 @@ def main():
         sample = list(dict.fromkeys(f'{x[3]}:{x[4]}' for x in q))[:4]
         summary = (f'fanout {len(hosts)} hosts / {len(ports)} ports / {len(q)} conns in '
                    f'{A.window}s (tcp {nets["tcp"]}, udp {nets["udp"]})')
-        detail = f'игр.игнор={gi} пиры: {", ".join(sample)}'
-        if reporter.report(m['user'], cip, ex[2], nets.most_common(1)[0][0],
-                           ex[3], ex[4], ex[6], summary, 'веер', detail) is not None:
-            q.clear()
+
+        if A.veer_tiering != 'on':
+            detail = f'игр.игнор={gi} пиры: {", ".join(sample)}'
+            if reporter.report(m['user'], cip, ex[2], nets.most_common(1)[0][0],
+                               ex[3], ex[4], ex[6], summary, 'веер', detail) is not None:
+                q.clear()
+            continue
+
+        # Тир различения ложняка. Анти-спам: разобрали клиента недавно — не пересчитываем
+        # (и rDNS не дёргаем) на каждой строке, пока держится cooldown.
+        if now - veer_last.get(m['user'], 0) < A.cooldown:
+            continue
+        veer_last[m['user']] = now
+        tq = veer_trips[m['user']]
+        tq.append(now)
+        while tq and tq[0] < now - A.veer_persist_window:
+            tq.popleft()
+        with btg_recent_lock:
+            btg_hit = now - btg_recent.get(m['user'], 0) <= VEER_CONFIRM_WINDOW
+        dc, res, unk = (0, 0, 0) if btg_hit else classify_hosts(hosts)
+        action = decide_veer(dc, res, unk, btg_hit, len(tq),
+                             A.veer_tiering == 'on', A.dc_min_fraction, A.veer_persist)
+        why = ('btguard-подтверждён' if btg_hit else
+               f'dc {dc}/{dc + res + unk}, повтор {len(tq)}/{A.veer_persist}')
+        detail = f'игр.игнор={gi} [{action}: {why}] пиры: {", ".join(sample)}'
+        if action == 'ban':
+            reporter.report(m['user'], cip, ex[2], nets.most_common(1)[0][0],
+                           ex[3], ex[4], ex[6], summary, 'веер', detail)
+        else:
+            log(f'[веер:{action}] user={m["user"]} ip={cip} {summary} | {detail}')
+        q.clear()
 
 
 if __name__ == '__main__':
