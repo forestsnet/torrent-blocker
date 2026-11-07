@@ -20,11 +20,14 @@ main() {
     local CONF=/etc/default/$NAME
     local BTG_NFT=/etc/nftables.d/btguard.nft
     local BTG_UNIT=/etc/systemd/system/btguard.service
+    local ALLOW_D=/etc/$NAME
+    local ALLOW=$ALLOW_D/allow.list
     local UPD_BIN=/usr/local/sbin/$NAME-update
     local UPD_SVC=/etc/systemd/system/$NAME-update.service
     local UPD_TIMER=/etc/systemd/system/$NAME-update.timer
     local MODE=install DRY="" PURGE=0 BTG=1 AU=1
     local o_window="" o_hosts="" o_ports="" o_cooldown="" o_max="" o_iports="" o_inets=""
+    local o_asrc="" o_ausers=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -46,6 +49,10 @@ main() {
             --ignore-ports=*) o_iports=${1#*=} ;;
             --ignore-nets)    shift; o_inets=${1-} ;;
             --ignore-nets=*)  o_inets=${1#*=} ;;
+            --allow-src)      shift; o_asrc=${1-} ;;
+            --allow-src=*)    o_asrc=${1#*=} ;;
+            --allow-users)    shift; o_ausers=${1-} ;;
+            --allow-users=*)  o_ausers=${1#*=} ;;
             --no-btguard)   BTG=0 ;;
             --no-autoupdate) AU=0 ;;
             -h|--help)      usage; return 0 ;;
@@ -75,7 +82,7 @@ main() {
         systemctl disable --now "$NAME-update.timer" >/dev/null 2>&1 || true
         command -v nft >/dev/null && { nft delete table ip btguard 2>/dev/null; nft delete table ip6 btguard6 2>/dev/null; } || true
         rm -f "$BIN" "$UNIT" "$BTG_UNIT" "$BTG_NFT" "$UPD_BIN" "$UPD_SVC" "$UPD_TIMER"
-        [ "$PURGE" = 1 ] && rm -f "$CONF"
+        [ "$PURGE" = 1 ] && rm -rf "$CONF" "$ALLOW_D"
         systemctl daemon-reload
         say "удалён$([ "$PURGE" = 1 ] && echo ' вместе с настройками' || echo "; настройки оставлены в $CONF")"
         return 0
@@ -136,6 +143,19 @@ main() {
     if [ ! -f "$CONF" ]; then
         config > "$CONF"
         [ -z "$DRY" ] && DRY=0
+    elif ! grep -q '^FTB_ALLOW_FILE=' "$CONF"; then
+        # Обновление: значения в конфиге не трогаем, но появившиеся ключи дописываем —
+        # иначе на уже стоящих нодах новых настроек в файле не видно.
+        {
+            echo
+            echo '# кого не банить. Файл со списком адресов/сетей/userId, перечитывается на ходу'
+            echo "FTB_ALLOW_FILE=$ALLOW"
+            echo '# то же сверх файла, через запятую: адреса и сети источника / userId'
+            echo 'FTB_ALLOW_SRC='
+            echo 'FTB_ALLOW_USERS='
+            echo '# как часто сверять mtime файла allow-листа, сек'
+            echo 'FTB_ALLOW_RELOAD=30'
+        } >> "$CONF"
     fi
     [ -n "$DRY" ]        && set_conf FTB_DRY_RUN             "$DRY"        "$CONF" || true
     [ -n "$o_window" ]   && set_conf FTB_WINDOW              "$o_window"   "$CONF" || true
@@ -145,6 +165,17 @@ main() {
     [ -n "$o_max" ]      && set_conf FTB_MAX_REPORTS_PER_MIN "$o_max"      "$CONF" || true
     [ -n "$o_iports" ]   && set_conf FTB_IGNORE_PORTS         "\"$o_iports\"" "$CONF" || true
     [ -n "$o_inets" ]    && set_conf FTB_IGNORE_NETS          "\"$o_inets\""  "$CONF" || true
+    [ -n "$o_asrc" ]     && set_conf FTB_ALLOW_SRC            "\"$o_asrc\""   "$CONF" || true
+    [ -n "$o_ausers" ]   && set_conf FTB_ALLOW_USERS          "\"$o_ausers\"" "$CONF" || true
+
+    # Каталог и заготовку листа создаём, сам лист не трогаем: его ведёт синкер, и
+    # переустановка либо авто-обновление не должны стирать разрешённые адреса.
+    mkdir -p "$ALLOW_D"
+    chmod 755 "$ALLOW_D"
+    if [ ! -f "$ALLOW" ]; then
+        allow_list > "$ALLOW"
+        chmod 644 "$ALLOW"
+    fi
     unit > "$UNIT"
     systemctl daemon-reload
 
@@ -187,8 +218,14 @@ fsnt-torrent-blocker — установка на Remnawave Node
   --max-reports N   предохранитель: отчётов в минуту (10)
   --ignore-ports L  доп. порты назначения через запятую, не считать веером
   --ignore-nets L   доп. сети CIDR через запятую, не считать веером (сверх игровых)
+  --allow-src L     адреса/сети источника, которым бан не выписываем (через запятую)
+  --allow-users L   userId, которым бан не выписываем (через запятую)
   --no-btguard      не ставить nft-дроп btguard (только веерный детект по логу)
   --no-autoupdate   не включать ежедневное авто-обновление с GitHub
+
+allow-лист (кого не банить) лежит в /etc/fsnt-torrent-blocker/allow.list — адрес,
+сеть CIDR или userId в строке. Файл перечитывается на ходу, по mtime и по SIGHUP
+(systemctl kill -s HUP --kill-whom=main fsnt-torrent-blocker), переустановку он переживает.
 EOF
 }
 
@@ -395,6 +432,27 @@ FTB_IGNORE_PORTS=
 FTB_IGNORE_NETS=
 # путь к access-логу xray; пусто — найти самому по конфигу ноды
 FTB_LOG=
+# кого не банить. Файл со списком адресов/сетей/userId, перечитывается на ходу
+FTB_ALLOW_FILE=/etc/fsnt-torrent-blocker/allow.list
+# то же сверх файла, через запятую: адреса и сети источника / userId
+FTB_ALLOW_SRC=
+FTB_ALLOW_USERS=
+# как часто сверять mtime файла allow-листа, сек
+FTB_ALLOW_RELOAD=30
+EOF
+}
+
+# Заготовка allow-листа. Пишется только если файла ещё нет.
+allow_list() {
+cat <<'EOF'
+# Кого не банить: адрес, сеть CIDR или userId (user:12345 либо просто число) в строке.
+# После «#» — комментарий. Файл перечитывается на ходу: по mtime и по SIGHUP
+# (systemctl kill -s HUP --kill-whom=main fsnt-torrent-blocker), переустановку и обновление переживает.
+#
+# Сюда идут прежде всего адреса, через которые приходит много клиентов сразу —
+# релеи и haproxy-фронты: бан такого адреса уронит всех, кто за ним.
+# То же самое задаётся и в панели, в ignoreLists плагина Torrent Blocker, но нода
+# держит этот список только в памяти и наружу не отдаёт — поэтому он нужен и здесь.
 EOF
 }
 
@@ -418,13 +476,14 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
 
-VERSION = '2.3.0'
+VERSION = '2.4.0'
 MARK = 'fsnt-torrent-blocker'
 
 
@@ -459,6 +518,15 @@ AP.add_argument('--ignore-ports', default=os.environ.get('FTB_IGNORE_PORTS', '')
                 help='доп. порты назначения, не считать веером — через запятую (FTB_IGNORE_PORTS)')
 AP.add_argument('--ignore-nets', default=os.environ.get('FTB_IGNORE_NETS', ''),
                 help='доп. сети (CIDR через запятую), не считать веером — сверх встроенных игровых (FTB_IGNORE_NETS)')
+AP.add_argument('--allow-file', default=os.environ.get('FTB_ALLOW_FILE', '/etc/fsnt-torrent-blocker/allow.list'),
+                help='файл allow-листа: адреса/сети источника и userId, которым бан не выписываем '
+                     '(FTB_ALLOW_FILE)')
+AP.add_argument('--allow-src', default=os.environ.get('FTB_ALLOW_SRC', ''),
+                help='адреса/сети источника в allow-листе сверх файла, через запятую (FTB_ALLOW_SRC)')
+AP.add_argument('--allow-users', default=os.environ.get('FTB_ALLOW_USERS', ''),
+                help='userId в allow-листе сверх файла, через запятую (FTB_ALLOW_USERS)')
+AP.add_argument('--allow-reload', type=int, default=env_int('FTB_ALLOW_RELOAD', 30),
+                help='как часто сверять mtime файла allow-листа, сек (FTB_ALLOW_RELOAD)')
 AP.add_argument('--btguard', choices=['auto', 'on', 'off'], default=os.environ.get('FTB_BTGUARD', 'auto'),
                 help='коррелировать дропы nft-таблицы btguard с клиентами и репортить (FTB_BTGUARD)')
 AP.add_argument('--dry-run', action='store_true', default=os.environ.get('FTB_DRY_RUN', '0') == '1',
@@ -678,6 +746,98 @@ class NetMatch:
 
     def __len__(self):
         return len(self.v4) + len(self.v6)
+
+
+class AllowList:
+    """Клиенты, которым бан не выписываем: адреса/сети источника и userId.
+
+    Лист держим файлом на диске не из удобства: ignoreLists плагина нода хранит только
+    в памяти и наружу не отдаёт (во внутреннем API есть лишь конфиг xray и вебхук), в
+    лог пишет один счётчик «N ignored IPs». Сверить нам не с чем, а после перезапуска
+    ноды, обновления образа или правки плагина в панели список должен остаться в силе —
+    поэтому его кладёт рядом синкер, а файл перечитывается по mtime и по SIGHUP.
+
+    Строка файла — адрес, сеть CIDR или userId (`user:12345` либо просто число, как его
+    отдаёт панель). Пустые строки и `#` игнорируются.
+    """
+
+    def __init__(self, path, inline_src='', inline_users=''):
+        self.path = path
+        self.inline = [x for x in re.split(r'[,\s]+', (inline_src or '').strip()) if x]
+        self.inline_users = {x for x in re.split(r'[,\s]+', (inline_users or '').strip()) if x}
+        self.lock = threading.Lock()
+        self.nets = NetMatch([])
+        self.users = set()
+        self.n_src = 0
+        self.stamp = ()
+        self.reload(force=True)
+
+    @staticmethod
+    def split_entries(entries):
+        nets, users = [], set()
+        for e in entries:
+            e = (e or '').split('#', 1)[0].strip()
+            if not e:
+                continue
+            if e.startswith('user:'):
+                u = e[5:].strip()
+                if u:
+                    users.add(u)
+            elif re.fullmatch(r'\d+', e):
+                users.add(e)                 # панель отдаёт userId числами
+            else:
+                nets.append(e)
+        return nets, users
+
+    def _read(self):
+        try:
+            st = os.stat(self.path)
+            with open(self.path, 'r', encoding='utf-8', errors='replace') as f:
+                return (st.st_mtime_ns, st.st_size), f.read().splitlines()
+        except OSError:
+            return None, []
+
+    def reload(self, force=False):
+        stamp, lines = self._read()
+        if not force and stamp == self.stamp:
+            return False
+        nets, users = self.split_entries(lines + self.inline)
+        users |= self.inline_users
+        with self.lock:
+            self.nets = NetMatch(nets)
+            self.users = users
+            self.n_src = len(nets)
+            self.stamp = stamp
+        return True
+
+    def allows(self, user, ip):
+        """Кем именно разрешён клиент: 'userId', 'адрес' или None."""
+        with self.lock:
+            if user and str(user) in self.users:
+                return 'userId'
+            if ip and ip in self.nets:
+                return 'адрес'
+        return None
+
+    def describe(self):
+        with self.lock:
+            return f'{self.n_src} адресов/сетей, {len(self.users)} userId'
+
+
+ALLOW = AllowList(A.allow_file, A.allow_src, A.allow_users)
+ALLOW_WAKE = threading.Event()
+
+
+def watch_allow():
+    """Перечитывает allow-лист: по таймеру (mtime) и сразу по SIGHUP от синкера."""
+    while True:
+        ALLOW_WAKE.wait(max(5, A.allow_reload))
+        ALLOW_WAKE.clear()
+        try:
+            if ALLOW.reload():
+                log(f'allow-лист перечитан: {ALLOW.describe()}')
+        except Exception as e:                        # noqa: BLE001 - поток не должен умирать
+            log(f'allow-лист: перечитать не удалось ({e})')
 
 
 IGNORE_NETS = NetMatch(GAME_NETS.split() + re.split(r'[,\s]+', A.ignore_nets.strip()))
@@ -1071,10 +1231,28 @@ class Reporter:
         self.node = node
         self.lock = threading.Lock()
         self.last_ip = {}
+        self.last_allow = {}
         self.sent = collections.deque()
         self.paused_until = 0
 
+    def note_allow(self, cip):
+        """True, если про этот allow-адрес пора снова написать в журнал."""
+        now = time.time()
+        with self.lock:
+            if now - self.last_allow.get(cip, 0) < A.cooldown:
+                return False
+            self.last_allow[cip] = now
+            return True
+
     def report(self, user, cip, cport, net, dst, dport, inbound, summary, tag, detail=''):
+        # Allow-лист проверяем до кулдауна и предохранителя. Нода такой отчёт всё равно
+        # отбросит по ignoreLists, но наш счётчик отчётов/мин он бы израсходовал — а это
+        # ровно те адреса, через которые приходит много клиентов сразу (релеи, haproxy).
+        why = ALLOW.allows(user, cip)
+        if why:
+            if self.note_allow(cip):
+                log(f'[{tag}:allow] user={user} ip={cip} {summary} — в allow-листе ({why})')
+            return 'allow'
         now = time.time()
         with self.lock:
             if now - self.last_ip.get(cip, 0) < A.cooldown:
@@ -1102,6 +1280,33 @@ class Reporter:
             return st
 
 
+def check_webhook_rules(node):
+    """Предупредить, если штатный детект xray остался без вебхука.
+
+    Вебхук на правила профиля нода навешивает ПО ТЕГАМ из includeRuleTags
+    (generate-api-config.ts): правило с таким ruleTag получает поле webhook, своё
+    правило нода вставляет на rulePosition. Поэтому правка профиля, в которой теги
+    переименовали или потеряли, молча выключает штатный детект - плагин в панели
+    остаётся «enabled», а сигнала по домену и порту больше нет. Наш веер и btguard
+    от этого не зависят, но знать об этом надо.
+    """
+    try:
+        rules = (node.cfg.get('routing') or {}).get('rules') or []
+    except AttributeError:
+        return
+    tagged = [r.get('ruleTag') for r in rules if (r.get('webhook') or {}).get('url')]
+    named = [t for t in tagged if t]
+    if not tagged:
+        log('внимание: ни одно правило роутинга не несёт webhook - штатный детект xray '
+            'выключен (проверь includeRuleTags плагина и ruleTag правил в профиле)')
+    elif len(tagged) == 1 and not named:
+        log('внимание: webhook есть только у правила, которое вставила нода - правил '
+            'профиля с тегами из includeRuleTags не нашлось')
+    else:
+        log('штатный детект xray: вебхук на %d правилах (%s)'
+            % (len(tagged), ', '.join(named) or 'без тегов'))
+
+
 def btguard_enabled():
     if A.btguard == 'off':
         return False
@@ -1117,28 +1322,37 @@ def btguard_enabled():
 
 def watch_btguard(reporter):
     """Второй сигнал: kernel-лог дропов btguard -> клиент из peer_index -> тот же вебхук.
-    Ловит UDP-контрплан торрента с точной привязкой к клиенту, дополняя веерный детект."""
-    try:
-        p = subprocess.Popen(['journalctl', '-kf', '-o', 'cat', '--no-pager', '-n', '0'],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             text=True, errors='replace')
-    except OSError as e:
-        log(f'btguard: journalctl недоступен ({e}) — корреляция выключена')
-        return
-    for ln in p.stdout:
-        m = BTG_LINE.search(ln)
-        if not m:
-            continue
-        key = (m['dst'], int(m['dpt']))
-        with pindex_lock:
-            hit = peer_index.get(key)
-        if not hit or time.time() - hit[2] > PINDEX_TTL:
-            continue                       # к клиенту не привязали — пропускаем
-        with btg_recent_lock:
-            btg_recent[hit[0]] = time.time()   # строгая сигнатура по клиенту — подтверждает веер
-        reporter.report(hit[0], hit[1], 0, 'udp', m['dst'], int(m['dpt']),
-                        (hit[3] if len(hit) > 3 else None),
-                        f'btguard {m["kind"]} udp:{m["dst"]}:{m["dpt"]}', m['kind'])
+    Ловит UDP-контрплан торрента с точной привязкой к клиенту, дополняя веерный детект.
+
+    journalctl переподключаем: он уходит не только от сбоя, но и от сигнала всей cgroup
+    службы (`systemctl kill -s HUP` без --kill-whom=main валит и его), а раньше поток
+    после этого молча заканчивался и btguard-сигнал пропадал до перезапуска службы.
+    """
+    while True:
+        try:
+            p = subprocess.Popen(['journalctl', '-kf', '-o', 'cat', '--no-pager', '-n', '0'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 text=True, errors='replace')
+        except OSError as e:
+            log(f'btguard: journalctl недоступен ({e}) — корреляция выключена')
+            return
+        for ln in p.stdout:
+            m = BTG_LINE.search(ln)
+            if not m:
+                continue
+            key = (m['dst'], int(m['dpt']))
+            with pindex_lock:
+                hit = peer_index.get(key)
+            if not hit or time.time() - hit[2] > PINDEX_TTL:
+                continue                   # к клиенту не привязали — пропускаем
+            with btg_recent_lock:
+                btg_recent[hit[0]] = time.time()   # строгая сигнатура по клиенту — подтверждает веер
+            reporter.report(hit[0], hit[1], 0, 'udp', m['dst'], int(m['dpt']),
+                            (hit[3] if len(hit) > 3 else None),
+                            f'btguard {m["kind"]} udp:{m["dst"]}:{m["dpt"]}', m['kind'])
+        rc = p.wait()
+        log(f'btguard: journalctl завершился (код {rc}) — переподключаюсь через 2с')
+        time.sleep(2)
 
 
 def selftest():
@@ -1195,6 +1409,26 @@ def selftest():
             print('WARN  отклика обработчика в логе ноды не видно — проверь вручную: docker logs')
     else:
         print('WARN  контейнер ноды не определён — разбор формата не проверен')
+    # allow-гейт: отчёт по адресу из листа не должен ни уходить в ноду, ни тратить
+    # предохранитель. Проверяем на подставном листе, боевой не трогаем.
+    global ALLOW
+    saved = ALLOW
+    try:
+        ALLOW = AllowList('/nonexistent/allow.list', inline_src='192.0.2.9', inline_users='0')
+        rp = Reporter(node)
+        by_ip = rp.report('selftest', '192.0.2.9', 0, 'udp', '192.0.2.2', 6881, None, 'selftest',
+                          'allow-check')
+        by_user = rp.report('0', '192.0.2.10', 0, 'udp', '192.0.2.2', 6881, None, 'selftest',
+                            'allow-check')
+        spent = len(rp.sent)
+    finally:
+        ALLOW = saved
+    if by_ip == 'allow' and by_user == 'allow' and spent == 0:
+        print(f'ok    allow-лист работает, боевой: {ALLOW.describe()} ({A.allow_file})')
+    else:
+        print(f'FAIL  allow-лист не отсекает отчёт (адрес {by_ip}, userId {by_user}, '
+              f'в счётчике {spent})')
+        ok = False
     print('итог: ' + ('OK' if ok else 'FAIL'))
     return 0 if ok else 1
 
@@ -1216,7 +1450,14 @@ def main():
         + (f', +{len(EXTRA_PORTS)} игнор-портов' if EXTRA_PORTS else '')
         + (f', {len(IGNORE_NETS)} игнор-сетей' if len(IGNORE_NETS) else '')
         + (', btguard: вкл' if btg else ', btguard: выкл')
+        + (f', allow-лист: {ALLOW.describe()}' if len(ALLOW.nets) or ALLOW.users else '')
         + (', DRY-RUN: в ноду не отправляю' if A.dry_run else ''))
+    check_webhook_rules(node)
+    try:
+        signal.signal(signal.SIGHUP, lambda *_: ALLOW_WAKE.set())
+    except (OSError, ValueError):
+        pass
+    threading.Thread(target=watch_allow, daemon=True).start()
     if btg:
         threading.Thread(target=watch_btguard, args=(reporter,), daemon=True).start()
 
@@ -1287,6 +1528,15 @@ def main():
         sample = list(dict.fromkeys(f'{x[3]}:{x[4]}' for x in q))[:4]
         summary = (f'fanout {len(hosts)} hosts / {len(ports)} ports / {len(q)} conns in '
                    f'{A.window}s (tcp {nets["tcp"]}, udp {nets["udp"]})')
+
+        # Клиент в allow-листе: ни rDNS-классификации, ни отчёта - бан ему не выписываем.
+        allow_why = ALLOW.allows(m['user'], cip)
+        if allow_why:
+            if reporter.note_allow(cip):
+                log(f'[веер:allow] user={m["user"]} ip={cip} {summary} '
+                    f'- в allow-листе ({allow_why})')
+            q.clear()
+            continue
 
         if A.veer_tiering != 'on':
             detail = f'игр.игнор={gi} пиры: {", ".join(sample)}'
